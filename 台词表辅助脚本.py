@@ -168,9 +168,6 @@ class ExcelBatchProcessor:
         if self.config.get('copy_speakers') and not self.old_queue:messagebox.showerror("错误","启用说话人复制但未选旧表。");return
         self.running=True;self.log("===== 处理开始 =====","INFO")
         try:
-            pass  # TODO: Add actual code here
-        except Exception as e:
-            self.log(f"Error in Stage 2 matching: {e}", "ERROR")
             pythoncom.CoInitialize()
             self.excel=win32.gencache.EnsureDispatch('Excel.Application')
             self.excel.Visible=False;self.excel.DisplayAlerts=False
@@ -231,6 +228,13 @@ class ExcelBatchProcessor:
         return name
 
     def _match_old(self, new_filepath):
+        # 防止新旧表相同
+        for old_fp in self.old_queue:
+            if os.path.normpath(os.path.abspath(old_fp)) == os.path.normpath(os.path.abspath(new_filepath)):
+                self.log(f"警告: 新表和旧表是同一个文件 '{os.path.basename(old_fp)}'，无法从自身复制", "WARNING")
+                return None
+        
+        # 原有的匹配逻辑...
         base_new_orig = os.path.basename(new_filepath)
         norm_new = self._normalize_name_for_matching(os.path.splitext(base_new_orig)[0])
         if not norm_new: self.log(f"新文件名 '{base_new_orig}' 规范化后为空。", "WARNING"); return None
@@ -654,7 +658,7 @@ class ExcelBatchProcessor:
 
             try:
                 current_words_set_coh = set(re.findall(r'[\u4e00-\u9fffA-Za-z0-9]+', current_text_coh))
-                next_words_set_coh = set(re.findall(r'[\u4e00-\u9fffA-Za-z0-9]+', next_text_coh))
+                next_words_set_coh = set(re.findall(r'[\u4e00-\u9fffA-ZaZ0-9]+', next_text_coh))
                 common_words_coh = current_words_set_coh.intersection(next_words_set_coh)
                 if common_words_coh:
                      transition_score_val += min(0.3, len(common_words_coh) * 0.05 + 0.05) 
@@ -845,67 +849,262 @@ class ExcelBatchProcessor:
             if not self.running: self.log("中止于S1后"); return
 
             # 完全重写的Stage 2分段匹配部分:
-            self.log("说话人复制 - Stage 2: 分段匹配开始 (优化版)...", "INFO")
+            self.log("说话人复制 - Stage 2: 分段匹配开始 (增强版)...", "INFO")
             import time
             start_time_s2 = time.time()
             matched_s2_lines = 0
             max_processing_time_s2 = 60
             processed_count = 0
             
-            # 预先计算规范化文本以提高性能
-            normalized_old_texts = {}
-            active_old_indices = []
-            for old_idx, old_item in enumerate(old_data_list):
-                if not old_item['used'] and old_item['dialog']:
-                    norm_text = "".join(re.findall(r'[\u4e00-\u9fffA-Za-z0-9]', old_item['dialog'])).lower()
-                    if norm_text:
-                        normalized_old_texts[old_idx] = norm_text
-                        active_old_indices.append(old_idx)
+            # 新增：按时间顺序跟踪旧表和新表的位置
+            old_position = 0
+            new_position = 0
             
-        # 按组预先处理新文本，避免重复处理
-        window_start = 0
+            # 构建一对多映射检测
+            one_to_many_map = {}
+            for old_idx, old_item in enumerate(old_data_list):
+                if old_item['used']: continue
+                old_text = old_item['dialog']
+                if not old_text: continue
+                
+                # 检测是否可能是多行合并的台词
+                sentences = re.split(r'[。！？.!?]', old_text)
+                sentences = [s for s in sentences if s.strip()]
+                
+                if len(sentences) > 1:
+                    # 可能是多行合并，记录以备后用
+                    one_to_many_map[old_idx] = {
+                        'sentences': sentences,
+                        'full_text': old_text,
+                        'speaker': old_item['speaker'],
+                        'matched_new_rows': []
+                    }
+        
+            # 收集连续未匹配段落，考虑时间顺序
+            unmatched_segments = []
+            segment = []
+            
+            for i, new_item in enumerate(new_data_list):
+                if not new_item['matched']:
+                    segment.append(new_item)
+                else:
+                    if segment:
+                        unmatched_segments.append(segment)
+                        segment = []
+            
+            if segment:  # 添加最后一个段落
+                unmatched_segments.append(segment)
+            
+            # 处理一对多映射：寻找旧表一行匹配新表多行
+            for old_idx, mapping in one_to_many_map.items():
+                if not self.running: break
+                
+                for segment in unmatched_segments:
+                    if len(segment) < 2: continue  # 太短的段落跳过
+                    
+                    # 检查整个段落是否匹配合并的台词
+                    combined_text = " ".join([item['dialog'] for item in segment])
+                    similarity = difflib.SequenceMatcher(None, combined_text, mapping['full_text']).ratio()
+                    
+                    if similarity >= general_match_thresh:
+                        # 找到匹配，将相同说话人应用到所有行
+                        for idx, item in enumerate(segment):
+                            try:
+                                row = item['row']
+                                ws_copy.Cells(row, speaker_col_f_idx).Value = mapping['speaker']
+                                item['speaker_after_match'] = mapping['speaker']
+                                item['matched'] = True
+                                item['paragraph_id'] = processed_count
+                                item['paragraph_position'] = idx
+                                matched_s2_lines += 1
+                                
+                                self.log_with_context(
+                                    f"S2 一对多匹配: 旧行合并文本 '{mapping['full_text'][:20]}...' -> " +
+                                    f"新行 {row} (相似度:{similarity:.2f})",
+                                    row=row, level="DEBUG"
+                                )
+                            except Exception as e:
+                                self.log_with_context(f"S2一对多写入失败:{e}", row=item['row'], level="WARNING")
+                        
+                        old_data_list[old_idx]['used'] = True
+                        processed_count += 1
+                        break  # 找到匹配后处理下一个合并台词
+            
+            # 原有的段落匹配逻辑保留，但增加时间顺序约束
+            for segment in unmatched_segments:
+                if len(segment) < 2: continue  # 跳过单行段落
+                
+                # 限制搜索范围：
+                search_start = max(0, old_position - 5)  # 从当前位置往前最多5行
+                search_end = min(len(old_data_list), old_position + 20)  # 往后最多20行
+                
+                best_match_indices = []
+                best_match_score = 0
+                best_match_start = -1
+                
+                # 在有限范围内搜索最佳匹配
+                for start_idx in range(search_start, search_end - len(segment) + 1):
+                    if not self.running: break
+                    
+                    # 检查连续段落是否都未被使用
+                    all_available = True
+                    for i in range(len(segment)):
+                        if start_idx + i >= len(old_data_list) or old_data_list[start_idx + i]['used']:
+                            all_available = False
+                            break
+                    
+                    if not all_available:
+                        continue
+                    
+                    # 计算段落相似度
+                    old_segment_texts = [old_data_list[start_idx + i]['dialog'] for i in range(len(segment))]
+                    
+                    # 计算整体段落相似度
+                    segment_similarity = 0
+                    for i in range(len(segment)):
+                        sim = difflib.SequenceMatcher(None, segment[i]['dialog'], old_segment_texts[i]).ratio()
+                        segment_similarity += sim
+                    segment_similarity /= len(segment)
+                    
+                    # 计算段落连贯性
+                    coherence = self._calculate_segment_coherence([item['dialog'] for item in segment])
+                    old_coherence = self._calculate_segment_coherence(old_segment_texts)
+                    coherence_diff = abs(coherence - old_coherence)
+                    coherence_score = 1.0 - min(coherence_diff, 0.5) * 2  # 归一化为0-1
+                    
+                    # 计算段落长度比例相似度
+                    len_similarity = 1.0
+                    for i in range(len(segment)):
+                        len_n = len(segment[i]['dialog'])
+                        len_o = len(old_segment_texts[i])
+                        if len_n > 0 and len_o > 0:
+                            len_similarity *= min(len_n, len_o) / max(len_n, len_o)
+                    len_similarity = len_similarity ** (1.0 / len(segment))  # 几何平均
+                    
+                    # 综合评分
+                    match_score = (
+                        seg_sim_w * segment_similarity +
+                        seg_coh_w * coherence_score +
+                        seg_len_w * len_similarity
+                    )
+                    
+                    if match_score > best_match_score:
+                        best_match_score = match_score
+                        best_match_start = start_idx
+                        best_match_indices = [start_idx + i for i in range(len(segment))]
+                
+                # 应用最佳匹配
+                if best_match_score >= general_match_thresh and best_match_start != -1:
+                    for i, new_item_to_match in enumerate(segment):
+                        old_idx = best_match_start + i
+                        if old_idx < len(old_data_list):
+                            old_item_match = old_data_list[old_idx]
+                            
+                            try:
+                                ws_copy.Cells(new_item_to_match['row'], speaker_col_f_idx).Value = old_item_match['speaker']
+                                new_item_to_match['speaker_after_match'] = old_item_match['speaker']
+                                new_item_to_match['matched'] = True
+                                old_item_match['used'] = True
+                                new_item_to_match['paragraph_id'] = processed_count
+                                new_item_to_match['paragraph_position'] = i
+                                matched_s2_lines += 1
+                                
+                                self.log_with_context(
+                                    f"S2 段落匹配: OldR {old_item_match['row']} (S:{old_item_match['speaker']}) -> " +
+                                    f"NewR {new_item_to_match['row']} (整体分数:{best_match_score:.2f})",
+                                    row=new_item_to_match['row'], level="DEBUG"
+                                )
+                            except Exception as e_s2w:
+                                self.log_with_context(f"S2写入失败:{e_s2w}", row=new_item_to_match['row'], level="WARNING")
+                    
+                    processed_count += 1
+            
+            self.log(f"说话人复制 - Stage 2: 分段匹配结束. 耗时 {time.time() - start_time_s2:.1f}秒, 匹配 {matched_s2_lines} 行.", "INFO")
+            if not self.running: self.log("中止于S2后"); return
 
-        self.log("说话人复制 - Stage 3: 模糊单行匹配开始...", "INFO")
-        unmatched_s3_count = 0
-        content_guess_threshold_final = self.config.get('content_guess_confidence_threshold', 0.7)
-        for new_item_s3 in new_data_list:
-            if not self.running or new_item_s3['matched'] or not new_item_s3['dialog']: continue
-            best_old_match_idx_s3, highest_ratio_s3 = -1, 0.0
-            for old_idx_s3, old_item_s3 in enumerate(old_data_list):
-                if old_item_s3['used'] or not old_item_s3['dialog']: continue
-                current_ratio_s3 = difflib.SequenceMatcher(None, new_item_s3['dialog'], old_item_s3['dialog']).ratio()
-                if current_ratio_s3 > highest_ratio_s3: highest_ratio_s3, best_old_match_idx_s3 = current_ratio_s3, old_idx_s3
-            row_s3 = new_item_s3['row']
-            if highest_ratio_s3 >= general_match_thresh and best_old_match_idx_s3 != -1:
-                old_match_s3 = old_data_list[best_old_match_idx_s3]
-                try:
-                    ws_copy.Cells(row_s3, speaker_col_f_idx).Value = old_match_s3['speaker']
-                    new_item_s3['speaker_after_match'] = old_match_s3['speaker']
-                    new_item_s3['matched'] = True; old_match_s3['used'] = True; matched_s3 += 1
-                    self.log_with_context(f"S3 模糊匹配: OldR {old_match_s3['row']} (S:{old_match_s3['speaker']}) -> NewR {row_s3} (R:{highest_ratio_s3:.2f})", row=row_s3, level="DEBUG")
-                except Exception as e_s3w: self.log_with_context(f"S3写入失败:{e_s3w}",row=row_s3,level="WARNING")
-            else: 
-                unmatched_s3_count +=1
-                try: 
-                    if new_item_s3.get('content_speaker_guess') and new_item_s3.get('content_confidence',0) >= content_guess_threshold_final :
-                        guessed_s_val = new_item_s3['content_speaker_guess'] 
-                        ws_copy.Cells(row_s3, speaker_col_f_idx).Value = guessed_s_val
-                        new_item_s3['speaker_after_match'] = guessed_s_val 
-                        ws_copy.Cells(row_s3, speaker_col_f_idx).Interior.ColorIndex = 6 
-                        self.log_with_context(f"S3 内容猜测填补: '{guessed_s_val}' (Conf:{new_item_s3['content_confidence']:.2f}), 标黄", row=row_s3, level="INFO")
-                    else: 
-                        ws_copy.Cells(row_s3, speaker_col_f_idx).Interior.ColorIndex = 3 
-                except Exception as e_s3color: self.log_with_context(f"S3标色失败:{e_s3color}",row=row_s3,level="WARNING")
-        self.log(f"说话人复制 - Stage 3: 模糊单行匹配结束. 匹配 {matched_s3} 行. 未匹配 {unmatched_s3_count} 行.", "INFO")
-        if not self.running: self.log("中止于S3后"); return
+            self.log("说话人复制 - Stage 3: 有序模糊单行匹配开始...", "INFO")
+            unmatched_s3_count = 0
+            
+            # 重置位置跟踪
+            old_position = 0
+            for new_item_s3 in new_data_list:
+                if not self.running or new_item_s3['matched']: continue
+                
+                # 在附近范围内寻找最佳匹配
+                search_window = 15  # 搜索窗口大小
+                best_old_match_idx_s3, highest_ratio_s3 = -1, 0.0
+                
+                # 优先在时间顺序合理的范围内搜索
+                search_start = max(0, old_position - 5)
+                search_end = min(len(old_data_list), old_position + search_window)
+                
+                for old_idx_s3 in range(search_start, search_end):
+                    old_item_s3 = old_data_list[old_idx_s3]
+                    if old_item_s3['used'] or not old_item_s3['dialog']: continue
+                    
+                    current_ratio_s3 = difflib.SequenceMatcher(None, new_item_s3['dialog'], old_item_s3['dialog']).ratio()
+                    if current_ratio_s3 > highest_ratio_s3:
+                        highest_ratio_s3, best_old_match_idx_s3 = current_ratio_s3, old_idx_s3
+                
+                row_s3 = new_item_s3['row']
+                if highest_ratio_s3 >= general_match_thresh and best_old_match_idx_s3 != -1:
+                    # 找到有效匹配，更新旧表位置
+                    old_match_s3 = old_data_list[best_old_match_idx_s3]
+                    old_position = best_old_match_idx_s3 + 1
+                    
+                    try:
+                        ws_copy.Cells(row_s3, speaker_col_f_idx).Value = old_match_s3['speaker']
+                        new_item_s3['speaker_after_match'] = old_match_s3['speaker']
+                        new_item_s3['matched'] = True
+                        old_match_s3['used'] = True
+                        matched_s3 += 1
+                        self.log_with_context(f"S3 有序匹配: OldR {old_match_s3['row']} -> NewR {row_s3} (R:{highest_ratio_s3:.2f})", row=row_s3, level="DEBUG")
+                    except Exception as e_s3w:
+                        self.log_with_context(f"S3写入失败:{e_s3w}", row=row_s3, level="WARNING")
+                else:
+                    # 只对内容猜测更有信心的情况进行标记，降低误标红率
+                    unmatched_s3_count += 1
+                    try:
+                        content_guess_threshold_final = self.config.get('content_guess_confidence_threshold', 0.7)
+                        content_guess_threshold_higher = content_guess_threshold_final + 0.1  # 提高阈值
+                        if new_item_s3.get('content_speaker_guess') and new_item_s3.get('content_confidence', 0) >= content_guess_threshold_higher:
+                            guessed_s_val = new_item_s3['content_speaker_guess']
+                            ws_copy.Cells(row_s3, speaker_col_f_idx).Value = guessed_s_val
+                            new_item_s3['speaker_after_match'] = guessed_s_val
+                            ws_copy.Cells(row_s3, speaker_col_f_idx).Interior.ColorIndex = 6
+                            self.log_with_context(f"S3 内容猜测填补: '{guessed_s_val}' (高可信度:{new_item_s3['content_confidence']:.2f})", row=row_s3, level="INFO")
+                        else:
+                            # 不再标红所有未匹配项，只标记那些特别可疑的
+                            suspicious = False
+                            for prev_idx in range(max(0, i-1), max(0, i-3), -1):
+                                if prev_idx >= 0 and prev_idx < len(new_data_list):
+                                    prev_item = new_data_list[prev_idx]
+                                    if prev_item.get('matched') and prev_item.get('speaker_after_match'):
+                                        # 如果前面几行台词与当前对话模式不符，标记为可疑
+                                        if self._looks_like_different_speaker(prev_item['dialog'], new_item_s3['dialog']):
+                                            suspicious = True
+                                            break
+                        
+                        if suspicious:
+                            ws_copy.Cells(row_s3, speaker_col_f_idx).Interior.ColorIndex = 3
+                    except Exception as e_s3color:
+                        self.log_with_context(f"S3标色失败:{e_s3color}", row=row_s3, level="WARNING")
+            self.log(f"说话人复制 - Stage 3: 模糊单行匹配结束. 匹配 {matched_s3} 行. 未匹配 {unmatched_s3_count} 行.", "INFO")
+            if not self.running: 
+                self.log("中止于S3后")
+                return
 
-        self._process_paragraph_punctuation(ws_copy, new_data_list, dialog_col_g_idx)
-        if not self.running: self.log("中止于段落标点后处理后"); return
-        self._handle_special_cases(ws_copy, new_data_list, speaker_col_f_idx, dialog_col_g_idx)
+            # 这些行必须在try块内，不能在try块之外
+            self._process_paragraph_punctuation(ws_copy, new_data_list, dialog_col_g_idx)
+            if not self.running: 
+                self.log("中止于段落标点后处理后")
+                return
+                
+            self._handle_special_cases(ws_copy, new_data_list, speaker_col_f_idx, dialog_col_g_idx)
 
             total_matched = matched_s1 + matched_s2_lines + matched_s3
             self.log(f"说话人复制总结: 总匹配行数 {total_matched} (精确:{matched_s1}, 分段行数:{matched_s2_lines}, 模糊:{matched_s3}).", "INFO")
-    
+            
         except Exception as e:
             self.log(f"复制说话人主流程发生严重错误: {e}", "CRITICAL")
             self.log(traceback.format_exc(), "DEBUG")
@@ -913,134 +1112,109 @@ class ExcelBatchProcessor:
             if old_wb_copy and hasattr(old_wb_copy, 'close') and not getattr(old_wb_copy, 'closed', True):
                 try: old_wb_copy.close()
                 except Exception as e_close_old_wb: self.log(f"关闭旧工作簿时出错: {e_close_old_wb}", "ERROR")
-    # ==============================================================================
-    # END: _copy_speakers and its helper methods
-    # ==============================================================================
 
-    def _fix_timestamp_overlaps(self, ws, start_row, last_row):
-        """检查并修复时间轴重叠问题"""
-        if not ws or last_row < start_row + 1:  # 至少需要两行数据才能检查重叠
-            self.log("时间轴检查: 行数不足，跳过检查", "INFO")
-            return
-
-        self.log(f"开始检查时间轴重叠问题 (行 {start_row}-{last_row})...", "INFO")
-        d_col_idx = self._col2idx('D')  # 开始时间列
-        e_col_idx = self._col2idx('E')  # 结束时间列
-        fixed_count = 0
-
-        for curr_row in range(start_row, last_row):
-            if not self.running:
-                break
-
-            try:
-                # 获取当前行结束时间和下一行开始时间
-                curr_end_time_str = str(ws.Cells(curr_row, e_col_idx).Value or "").strip()
-                next_start_time_str = str(ws.Cells(curr_row + 1, d_col_idx).Value or "").strip()
+    def _validate_speaker_assignments(self, ws, new_data_list, speaker_col_idx):
+        self.log("进行说话人匹配自检验证...", "INFO")
+        issues = 0
+        
+        # 检查同一角色连续说话行过多
+        consecutive_same_speaker = 0
+        last_speaker = None
+        
+        # 按行遍历检查
+        for item in sorted(new_data_list, key=lambda x: x['row']):
+            current_speaker = item.get('speaker_after_match')
+            if not current_speaker:
+                continue
                 
-                # 检查是否为有效时间格式
-                if not curr_end_time_str or not next_start_time_str:
-                    continue
-                    
-                # 转换为可比较的时间格式 (00:00:00,000)
-                curr_end_ms = self._time_to_ms(curr_end_time_str)
-                next_start_ms = self._time_to_ms(next_start_time_str)
-
-                if curr_end_ms is None or next_start_ms is None:
-                    self.log_with_context(f"时间格式无效: 结束={curr_end_time_str}, 开始={next_start_time_str}", curr_row, e_col_idx, "WARNING")
-                    continue
-                
-                # 检查是否重叠
-                if curr_end_ms > next_start_ms:
-                    # 修复重叠问题，将当前行结束时间设置为下一行开始时间
-                    ws.Cells(curr_row, e_col_idx).Value = next_start_time_str
-                    fixed_count += 1
-                    self.log_with_context(
-                        f"修复时间轴重叠: {curr_end_time_str} -> {next_start_time_str}", 
-                        curr_row, e_col_idx, "INFO"
-                    )
-            except Exception as e:
-                self.log_with_context(f"检查时间轴时出错: {e}", curr_row, e_col_idx, "WARNING")
-    
-        if fixed_count > 0:
-            self.log(f"时间轴检查完成，已修复 {fixed_count} 处重叠问题", "INFO")
+            # 检查同一角色连续说话
+            if current_speaker == last_speaker:
+                consecutive_same_speaker += 1
+                if consecutive_same_speaker > 7:  # 超过7行同一角色连续说话
+                    row = item['row']
+                    self.log_with_context(f"自检警告: 角色 '{current_speaker}' 连续说话超过7行", row=row, level="WARNING")
+                    # 标记可能的问题
+                    try:
+                        ws.Cells(row, speaker_col_idx).Interior.ColorIndex = 45  # 使用不同的颜色标记
+                        issues += 1
+                    except:
+                        pass
+            else:
+                consecutive_same_speaker = 1
+                last_speaker = current_speaker
+        
+        # 检查其他可能的问题...
+        
+        if issues > 0:
+            self.log(f"自检发现 {issues} 处可能的说话人分配问题，已用特别颜色标记", "WARNING")
         else:
-            self.log("时间轴检查完成，未发现重叠问题", "INFO")
+            self.log("说话人分配自检通过", "INFO")
 
-    def _time_to_ms(self, time_str):
-        """将时间字符串转换为毫秒，适用于格式如00:00:00,000或00:00:00.000"""
-        try:
-            # 处理两种常见的时间格式
-            time_str = time_str.replace(',', '.')
-            
-            # 匹配标准时间格式 HH:MM:SS.mmm
-            match = re.match(r'(\d{1,2}):(\d{1,2}):(\d{1,2})\.?(\d{1,3})?', time_str)
-            if not match:
-                return None
-                
-            hours = int(match.group(1))
-            minutes = int(match.group(2))
-            seconds = int(match.group(3))
-            milliseconds = int(match.group(4) or '0')
-            
-            total_ms = hours * 3600000 + minutes * 60000 + seconds * 1000 + milliseconds
-            return total_ms
-        except Exception:
-            return None
-
-    def adjust_images(self, worksheet_img):
-        if not self.running: return
-        try:
-            if not hasattr(worksheet_img, 'Shapes') or worksheet_img.Shapes is None or worksheet_img.Shapes.Count == 0:
-                self.log(f"工作表 '{worksheet_img.Name}' 中未发现图片或Shapes对象无效。", "INFO"); return
-            
-            succ_count, err_count, total_shapes = 0, 0, worksheet_img.Shapes.Count
-            self.log(f"开始调整工作表 '{worksheet_img.Name}' 中的 {total_shapes} 个图片/形状 (按当前尺寸的90%进行缩放)...", "INFO")
-            scale_factor = self.config.get('image_scale_factor', 0.9)
-            relative_to_current_size = MSO_FALSE 
-            
-            self.log(f"图片缩放配置: Factor={scale_factor}, RelativeToOriginalSize={relative_to_current_size == MSO_TRUE} (False表示基于当前尺寸)", "DEBUG")
-
-            for i_img in range(1, total_shapes + 1):
-                if not self.running: break
-                shp = None
-                try:
-                    shp = worksheet_img.Shapes.Item(i_img)
-                    shape_name_log = shp.Name if hasattr(shp, 'Name') and shp.Name else f"形状索引{i_img}"
-
-                    if shp.Type in [MSO_PICTURE, MSO_LINKED_PICTURE]:
-                        current_w, current_h = shp.Width, shp.Height
-                        self.log(f"图片'{shape_name_log}':类型={shp.Type},调整前当前 W={current_w:.1f},H={current_h:.1f}", "TRACE")
-                        if shp.LockAspectRatio == MSO_FALSE:
-                            self.log(f"图片'{shape_name_log}':原未锁定宽高比,现锁定", "DEBUG"); shp.LockAspectRatio = MSO_TRUE
-                        
-                        shp.ScaleWidth(Factor=scale_factor, RelativeToOriginalSize=relative_to_current_size, Scale=MSO_SCALE_FROM_TOP_LEFT)
-                        # shp.Left += 6 # 如果需要固定偏移，取消注释
-                        self.log(f"图片'{shape_name_log}':已按当前尺寸{scale_factor*100}%缩放. 调整后 W={shp.Width:.1f},H={shp.Height:.1f}", "DEBUG"); succ_count += 1
-                except Exception as esh:
-                    err_count += 1; s_log_name = (shp.Name if shp and hasattr(shp,'Name') and shp.Name else f"形状{i_img}")
-                    self.log(f"处理图片'{s_log_name}'失败:{esh!r}", "ERROR")
-            if total_shapes > 0: self.log(f"图片调整:成功{succ_count},失败{err_count}", "INFO")
-        except Exception as eimg: self.log(f"图片处理模块错误:{eimg}", "ERROR"); self.log(traceback.format_exc(),"DEBUG")
-
-
-    def _col2idx(self, col_letter_in):
-        idx, pwr = 0, 1
-        if not col_letter_in or not isinstance(col_letter_in, str) or not col_letter_in.isalpha():
-            self.log(f"无效列名'{col_letter_in}',返1", "ERROR")
-            return 1
-        for char_c in reversed(col_letter_in.upper()):
-            idx += (ord(char_c) - ord('A') + 1) * pwr
-            pwr *= 26
+    def _col2idx(self, col_letter):
+        """将Excel列字母转换为列索引数字"""
+        if not col_letter or not isinstance(col_letter, str):
+            return 1  # 默认返回第一列
+        col_letter = col_letter.upper().strip()
+        idx = 0
+        for c in col_letter:
+            idx = idx * 26 + (ord(c) - ord('A') + 1)
         return idx
 
-    def _idx2col(self, col_idx_in):
-        if not isinstance(col_idx_in, int) or col_idx_in < 1: return str(col_idx_in)
-        col_s, num = "", col_idx_in
-       
-        while num > 0: num, rem = divmod(num-1, 26); col_s = chr(65+rem)+col_s
-        return col_s
+    def _idx2col(self, col_idx):
+        """将列索引数字转换为Excel列字母"""
+        if not isinstance(col_idx, int) or col_idx < 1:
+            return 'A'  # 默认返回A列
+        result = ""
+        while col_idx > 0:
+            col_idx, remainder = divmod(col_idx - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
 
-if __name__ == '__main__':
-    root = tk.Tk()
-    app = ExcelBatchProcessor(root)
-    root.mainloop()
+    def adjust_images(self, ws_images):
+        """调整工作表中的图片尺寸"""
+        try:
+            # 获取工作表中所有图片和形状
+            shape_count = ws_images.Shapes.Count
+            if shape_count == 0:
+                self.log("图片调整: 未发现图片/形状", "INFO")
+                return
+            
+            # 明确设置为1.0，表示保持原尺寸
+            scale_factor = 1.0  # 保持原尺寸，不进行缩放
+            
+            self.log(f"开始处理工作表 '{ws_images.Name}' 中的 {shape_count} 个图片/形状 (保持原尺寸)...", "INFO")
+            
+            success_count = 0
+            failure_count = 0
+            
+            # 遍历所有形状对象，但不进行缩放处理
+            for i in range(1, shape_count + 1):
+                if not self.running:
+                    break
+                    
+                try:
+                    shape = ws_images.Shapes(i)
+                    # 只进行记录，不执行缩放操作
+                    original_width = shape.Width
+                    original_height = shape.Height
+                    self.log(f"图片调整: 形状{i} - 保持原尺寸 {original_width:.1f}x{original_height:.1f}", "TRACE")
+                    success_count += 1
+                except Exception as e_shape:
+                    failure_count += 1
+                    self.log(f"图片调整: 形状{i}处理失败: {e_shape}", "WARNING")
+                    
+            self.log(f"图片调整:成功{success_count},失败{failure_count}", "INFO")
+        except Exception as e_all_images:
+            self.log(f"处理图片时发生错误: {e_all_images}", "ERROR")
+
+# 主程序入口
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = ExcelBatchProcessor(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"程序启动失败: {e}")
+        import traceback
+        traceback.print_exc()
+        input("按任意键退出...")  # 在控制台窗口关闭前暂停
